@@ -1,5 +1,5 @@
 # nweb version 24
- * 
+ * Adjust config.mk to fit your needs
  * `make all` to build
  * `./nweb <port> <web_root>` to run
    You probably want to redirect the output to a log file, so for example run
