@@ -9,7 +9,13 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#define VERSION 23
+
+#ifdef USE_LIBMAGIC
+#include <magic.h>
+#endif
+
+#include <time.h>
+#define VERSION 24
 #define BUFSIZE 8096
 #define ERROR      42
 #define LOG        44
@@ -34,41 +40,47 @@ struct {
   {"tar", "image/tar" },
   {"htm", "text/html" },
   {"html","text/html" },
-  {0,0} };
+  {"css", "text/css"  },
+  {"js",  "text/javascript"},
+  {0,0}
+};
 
-void logger(int type, char *s1, char *s2, int socket_fd)
+static void logger(int type, const char *s1, const char *s2, int socket_fd)
 {
-  int fd ;
   char logbuffer[BUFSIZE*2];
 
   switch (type) {
-  case ERROR: (void)sprintf(logbuffer,"ERROR: %s:%s Errno=%d exiting pid=%d",s1, s2, errno,getpid());
+  case ERROR:
+    (void)sprintf(logbuffer,"[ERROR]: %s:%s Errno=%d exiting pid=%d",s1, s2, errno,getpid());
     break;
   case FORBIDDEN:
     (void)write(socket_fd, "HTTP/1.1 403 Forbidden\nContent-Length: 185\nConnection: close\nContent-Type: text/html\n\n<html><head>\n<title>403 Forbidden</title>\n</head><body>\n<h1>Forbidden</h1>\nThe requested URL, file type or operation is not allowed on this simple static file webserver.\n</body></html>\n",271);
-    (void)sprintf(logbuffer,"FORBIDDEN: %s:%s",s1, s2);
+    (void)sprintf(logbuffer,"[FORBIDDEN]: %s:%s",s1, s2);
     break;
   case NOTFOUND:
     (void)write(socket_fd, "HTTP/1.1 404 Not Found\nContent-Length: 136\nConnection: close\nContent-Type: text/html\n\n<html><head>\n<title>404 Not Found</title>\n</head><body>\n<h1>Not Found</h1>\nThe requested URL was not found on this server.\n</body></html>\n",224);
-    (void)sprintf(logbuffer,"NOT FOUND: %s:%s",s1, s2);
+    (void)sprintf(logbuffer,"[NOT FOUND]: %s:%s",s1, s2);
     break;
-  case LOG: (void)sprintf(logbuffer," INFO: %s:%s:%d",s1, s2,socket_fd); break;
+  case LOG:
+    (void)sprintf(logbuffer,"[INFO]: %s:%s:%d",s1, s2,socket_fd);
+    break;
   }
-  /* No checks here, nothing can be done with a failure anyway */
-  if((fd = open("nweb.log", O_CREAT| O_WRONLY | O_APPEND,0644)) >= 0) {
-    (void)write(fd,logbuffer,strlen(logbuffer));
-    (void)write(fd,"\n",1);
-    (void)close(fd);
-  }
+  char time_buf[26];
+  time_t now;
+  time(&now);
+  ctime_r(&now, time_buf);
+  time_buf[24] = 0;
+  time_buf[25] = 0;
+  (void)fprintf(stdout, "%s %s\n", time_buf, logbuffer);
   if(type == ERROR || type == NOTFOUND || type == FORBIDDEN) exit(3);
 }
 
 /* this is a child web server process, so we can exit on errors */
-void web(int fd, int hit)
+static void web(int fd, int hit)
 {
   int j, file_fd, buflen;
   long i, ret, len;
-  char * fstr;
+  const char * fstr;
   static char buffer[BUFSIZE+1]; /* static so zero filled */
 
   ret =read(fd,buffer,BUFSIZE);   /* read Web request in one go */
@@ -91,6 +103,8 @@ void web(int fd, int hit)
       break;
     }
   }
+  if(buffer[5] == '/') /* check for illegal absolute directory path use */
+   logger(FORBIDDEN,"Absolute directory (/) path names not supported",buffer,fd);
   for(j=0;j<i-1;j++)   /* check for illegal parent directory use .. */
     if(buffer[j] == '.' && buffer[j+1] == '.') {
       logger(FORBIDDEN,"Parent directory (..) path names not supported",buffer,fd);
@@ -100,15 +114,41 @@ void web(int fd, int hit)
 
   /* work out the file type and check we support it */
   buflen=strlen(buffer);
-  fstr = (char *)0;
-  for(i=0;extensions[i].ext != 0;i++) {
+  fstr = NULL;
+  for (i = 0; extensions[i].ext != 0; i++) {
     len = strlen(extensions[i].ext);
-    if( !strncmp(&buffer[buflen-len], extensions[i].ext, len)) {
-      fstr =extensions[i].filetype;
+    if (!strncmp(&buffer[buflen-len], extensions[i].ext, len)) {
+      fstr = extensions[i].filetype;
       break;
     }
   }
-  if(fstr == 0) logger(FORBIDDEN,"file extension type not supported",buffer,fd);
+  if (fstr == NULL) {
+#ifdef USE_LIBMAGIC
+    magic_t magic;
+    magic = magic_open(MAGIC_MIME | MAGIC_PRESERVE_ATIME);
+    if (magic == NULL) {
+      // TODO: error, but we can't really do anything about it
+    } else {
+      if(magic_load(magic, NULL) != 0) {
+        logger(ERROR, "magic_load:", magic_error(magic), fd);
+        magic_close(magic);
+        exit(1);
+      }
+      fstr = magic_file(magic, &buffer[5]);
+      /*if (fstr == NULL) {
+        fstr = "application/octet-stream";
+        // TODO: magic_error
+      }*/
+      magic_close(magic);
+    }
+    /* if we still don't have a mime type, use the default one*/
+    if (fstr == NULL) {
+      fstr = "application/octet-stream";
+    }
+#else
+    fstr = "application/octet-stream";
+#endif
+  }
 
   if(( file_fd = open(&buffer[5],O_RDONLY)) == -1) {  /* open the file for reading */
     logger(NOTFOUND, "failed to open file",&buffer[5],fd);
@@ -131,46 +171,32 @@ void web(int fd, int hit)
 
 int main(int argc, char **argv)
 {
-  int i, port, pid, listenfd, socketfd, hit;
+  int /*i,*/ port, pid, listenfd, socketfd, hit;
   socklen_t length;
   static struct sockaddr_in cli_addr; /* static = initialised to zeros */
   static struct sockaddr_in serv_addr; /* static = initialised to zeros */
 
   if( argc < 3  || argc > 3 || !strcmp(argv[1], "-?") ) {
-    (void)printf("hint: nweb Port-Number Top-Directory\t\tversion %d\n\n"
-  "\tnweb is a small and very safe mini web server\n"
-  "\tnweb only servers out file/web pages with extensions named below\n"
-  "\t and only from the named directory or its sub-directories.\n"
-  "\tThere is no fancy features = safe and secure.\n\n"
-  "\tExample: nweb 8181 /home/nwebdir &\n\n"
-  "\tOnly Supports:", VERSION);
-    for(i=0;extensions[i].ext != 0;i++)
-      (void)printf(" %s",extensions[i].ext);
-
-    (void)printf("\n\tNot Supported: URLs including \"..\", Java, Javascript, CGI\n"
-  "\tNot Supported: directories / /etc /bin /lib /tmp /usr /dev /sbin \n"
-  "\tNo warranty given or implied\n\tNigel Griffiths nag@uk.ibm.com\n"  );
+    printf("usage: nweb <port> <web_root>\n"
+      "nweb version: %d\n"
+      "nweb is a small and very safe mini web server\n"
+      "Example usage: nweb 8080 ./web_root > nweb.log &\n"
+      "No warranty given or implied\n"
+      "original author of version 23: Nigel Griffiths nag@uk.ibm.com\n"
+      "", VERSION);
     exit(0);
   }
-  if( !strncmp(argv[2],"/"   ,2 ) || !strncmp(argv[2],"/etc", 5 ) ||
-      !strncmp(argv[2],"/bin",5 ) || !strncmp(argv[2],"/lib", 5 ) ||
-      !strncmp(argv[2],"/tmp",5 ) || !strncmp(argv[2],"/usr", 5 ) ||
-      !strncmp(argv[2],"/dev",5 ) || !strncmp(argv[2],"/sbin",6) ){
-    (void)printf("ERROR: Bad top directory %s, see nweb -?\n",argv[2]);
-    exit(3);
-  }
+
   if(chdir(argv[2]) == -1){
     (void)printf("ERROR: Can't Change to directory %s\n",argv[2]);
     exit(4);
   }
-  /* Become deamon + unstopable and no zombies children (= no wait()) */
-  if(fork() != 0)
-    return 0; /* parent returns OK to shell */
-  (void)signal(SIGCLD, SIG_IGN); /* ignore child death */
-  (void)signal(SIGHUP, SIG_IGN); /* ignore terminal hangups */
-  for(i=0;i<32;i++)
-    (void)close(i);    /* close open files */
-  (void)setpgrp();    /* break away from process group */
+  signal(SIGCLD, SIG_IGN); /* ignore child death */
+  signal(SIGHUP, SIG_IGN); /* ignore terminal hangups */
+  close(STDIN_FILENO);
+  close(STDERR_FILENO);
+  setpgrp();    /* break away from process group */
+
   logger(LOG,"nweb starting",argv[1],getpid());
   /* setup the network socket */
   if((listenfd = socket(AF_INET, SOCK_STREAM,0)) <0)
