@@ -15,5 +15,5 @@ uninstall:
 
 .PHONY: clean
 clean:
-	rm nweb
+	rm -f nweb
 
