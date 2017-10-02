@@ -9,6 +9,8 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <sys/stat.h>
+#include <ctype.h>
 
 #ifdef USE_LIBMAGIC
 #include <magic.h>
@@ -44,6 +46,36 @@ struct {
   {"js",  "text/javascript"},
   {0,0}
 };
+
+// https://stackoverflow.com/questions/2673207/c-c-url-decode-library#14530993
+static void urldecode2(char *dst, const char *src)
+{
+  char a, b;
+  while (*src) {
+    if ((*src == '%') && ((a = src[1]) && (b = src[2])) && (isxdigit(a) && isxdigit(b))) {
+      if (a >= 'a')
+        a -= 'a'-'A';
+      if (a >= 'A')
+        a -= ('A' - 10);
+      else
+        a -= '0';
+      if (b >= 'a')
+        b -= 'a'-'A';
+      if (b >= 'A')
+        b -= ('A' - 10);
+      else
+        b -= '0';
+      *dst++ = 16*a+b;
+      src+=3;
+    } else if (*src == '+') {
+      *dst++ = ' ';
+      src++;
+    } else {
+      *dst++ = *src++;
+    }
+  }
+  *dst++ = '\0';
+}
 
 static void logger(int type, const char *s1, const char *s2, int socket_fd)
 {
@@ -103,12 +135,15 @@ static void web(int fd, int hit)
       break;
     }
   }
-  if(buffer[5] == '/') /* check for illegal absolute directory path use */
-   logger(FORBIDDEN,"Absolute directory (/) path names not supported",buffer,fd);
-  for(j=0;j<i-1;j++)   /* check for illegal parent directory use .. */
+  urldecode2(&buffer[5],&buffer[5]);
+  if(buffer[5] == '/') { /* check for illegal absolute directory path use */
+    logger(FORBIDDEN,"Absolute directory (/) path names not supported",buffer,fd);
+  }
+  for(j=0;j<i-1;j++) {   /* check for illegal parent directory use .. */
     if(buffer[j] == '.' && buffer[j+1] == '.') {
       logger(FORBIDDEN,"Parent directory (..) path names not supported",buffer,fd);
     }
+  }
   if( !strncmp(&buffer[0],"GET /\0",6) || !strncmp(&buffer[0],"get /\0",6) ) /* convert no filename to index file */
     (void)strcpy(buffer,"GET /index.html");
 
